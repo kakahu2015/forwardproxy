@@ -120,6 +120,10 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 func (h *Handler) Provision(ctx caddy.Context) error {
 	h.logger = ctx.Logger(h)
 
+	if len(h.SocksDomains) > 0 {
+        h.logger.Info("Configured SOCKS domains", zap.Strings("domains", h.SocksDomains))
+    }
+
 	if h.DialTimeout <= 0 {
 		h.DialTimeout = caddy.Duration(30 * time.Second)
 	}
@@ -514,7 +518,7 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 	}
 
 	// 新增的代码
-	if h.shouldUseSocksProxy(host) && h.upstream != nil {
+	/*if h.shouldUseSocksProxy(host) && h.upstream != nil {
 		// 使用 SOCKS5 代理
 		return h.dialContext(ctx, network, hostPort)
 	}
@@ -527,7 +531,14 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 			return conn, caddyhttp.Error(http.StatusBadGateway, err)
 		}
 		return conn, nil
-	}
+	}*/
+     // 检查是否应该使用 SOCKS 代理
+	 if h.shouldUseSocksProxy(host) && h.upstream != nil {
+        // 使用 SOCKS5 代理（upstream）
+        h.logger.Debug("Using SOCKS5 proxy for domain", zap.String("domain", host))
+        return h.dialContext(ctx, network, hostPort)
+    }
+
 
 	if !h.portIsAllowed(port) {
 		// return nil, &proxyError{S: "port " + port + " is not allowed", Code: http.StatusForbidden}
@@ -560,7 +571,7 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 	return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("no allowed IP addresses for %s", host))
 }
 
-// 在 dialContextCheckACL 方法后添加这个新方法
+// Add this new method to the Handler struct
 func (h Handler) shouldUseSocksProxy(host string) bool {
     for _, rule := range h.parsedSocksDomains {
         if rule.isWildcard {
