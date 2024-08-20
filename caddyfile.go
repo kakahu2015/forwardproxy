@@ -139,6 +139,11 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.Err("upstream directive specified more than once")
 			}
 			h.Upstream = args[0]
+		case "socks_domains":
+			if len(args) == 0 {
+				return d.ArgErr()
+			}
+			h.SocksDomains = args
 		case "acl":
 			for nesting := d.Nesting(); d.NextBlock(nesting); {
 				aclDirective := d.Val()
