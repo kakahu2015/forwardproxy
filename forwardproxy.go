@@ -57,6 +57,8 @@ type Handler struct {
 
 	SocksDomains []string `json:"socks_domains,omitempty"`
 
+	parsedSocksDomains []domainRule
+
 	logger *zap.Logger
 
 	// Filename of the PAC file to serve.
@@ -98,6 +100,13 @@ type Handler struct {
 	// TODO: temporary/deprecated - we should try to reuse existing authentication modules instead!
 	AuthCredentials [][]byte `json:"auth_credentials,omitempty"` // slice with base64-encoded credentials
 }
+
+type domainRule struct {
+    prefix string
+    suffix string
+    isWildcard bool
+}
+
 
 // CaddyModule returns the Caddy module information.
 func (Handler) CaddyModule() caddy.ModuleInfo {
@@ -219,6 +228,17 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 			}
 		}
 	}
+
+	    // 解析 SocksDomains
+		for _, domain := range h.SocksDomains {
+			rule := domainRule{suffix: domain}
+			if strings.HasPrefix(domain, "*.") {
+				rule.isWildcard = true
+				rule.prefix = ""
+				rule.suffix = domain[2:]
+			}
+			h.parsedSocksDomains = append(h.parsedSocksDomains, rule)
+		}
 
 	return nil
 }
@@ -542,12 +562,16 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 
 // 在 dialContextCheckACL 方法后添加这个新方法
 func (h Handler) shouldUseSocksProxy(host string) bool {
-	for _, domain := range h.SocksDomains {
-		if strings.HasSuffix(host, domain) {
-			return true
-		}
-	}
-	return false
+    for _, rule := range h.parsedSocksDomains {
+        if rule.isWildcard {
+            if strings.HasSuffix(host, rule.suffix) && strings.Count(host, ".") > strings.Count(rule.suffix, ".") {
+                return true
+            }
+        } else if strings.HasSuffix(host, rule.suffix) {
+            return true
+        }
+    }
+    return false
 }
 
 func (h Handler) hostIsAllowed(hostname string, ip net.IP) bool {
