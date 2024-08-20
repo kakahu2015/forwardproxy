@@ -4,7 +4,7 @@ on:
     branches: [naive]
     paths-ignore: [README.md]
   release:
-    types: [published]
+    types: [created]
 defaults:
   run:
     shell: bash
@@ -31,8 +31,10 @@ jobs:
         with:
           name: ${{ env.BUNDLE }}.tar.xz caddy executable sha256 ${{ env.SHA256SUM }}
           path: sha256sum.txt
-      - name: Upload caddy assets
-        if: ${{ github.event_name == 'release' }}
-        run: gh release upload "${GITHUB_REF##*/}"  ${{ env.BUNDLE }}.tar.xz --clobber
+      - name: Upload to Release
+        if: github.event_name == 'push' || github.event_name == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ${{ env.BUNDLE }}.tar.xz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
