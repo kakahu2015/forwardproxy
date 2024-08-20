@@ -533,12 +533,12 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 		return conn, nil
 	}*/
      // 检查是否应该使用 SOCKS 代理
-	 if h.shouldUseSocksProxy(host) && h.upstream != nil {
-        // 使用 SOCKS5 代理（upstream）
-        h.logger.Debug("Using SOCKS5 proxy for domain", zap.String("domain", host))
-        return h.dialContext(ctx, network, hostPort)
-    }
-
+	 if h.shouldUseSocksProxy(host) {
+		if !h.hostIsAllowed(host, net.ParseIP(host)) {
+			return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("host %s is not allowed", host))
+		}
+		return h.dialContext(ctx, network, hostPort)
+	}
 
 	if !h.portIsAllowed(port) {
 		// return nil, &proxyError{S: "port " + port + " is not allowed", Code: http.StatusForbidden}
