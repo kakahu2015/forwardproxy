@@ -54,6 +54,9 @@ func init() {
 //
 // EXPERIMENTAL: This handler is still experimental and subject to breaking changes.
 type Handler struct {
+
+	SocksDomains []string `json:"socks_domains,omitempty"`
+
 	logger *zap.Logger
 
 	// Filename of the PAC file to serve.
@@ -490,6 +493,12 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 		return nil, caddyhttp.Error(http.StatusBadRequest, err)
 	}
 
+	// 新增的代码
+	if h.shouldUseSocksProxy(host) && h.upstream != nil {
+		// 使用 SOCKS5 代理
+		return h.dialContext(ctx, network, hostPort)
+	}
+
 	if h.upstream != nil {
 		// if upstreaming -- do not resolve locally nor check acl
 		conn, err = h.dialContext(ctx, network, hostPort)
@@ -529,6 +538,16 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 	}
 
 	return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("no allowed IP addresses for %s", host))
+}
+
+// 在 dialContextCheckACL 方法后添加这个新方法
+func (h Handler) shouldUseSocksProxy(host string) bool {
+	for _, domain := range h.SocksDomains {
+		if strings.HasSuffix(host, domain) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h Handler) hostIsAllowed(hostname string, ip net.IP) bool {
