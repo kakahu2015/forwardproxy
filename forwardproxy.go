@@ -40,6 +40,9 @@ func init() {
 // EXPERIMENTAL: This handler is still experimental and subject to breaking changes.
 type Handler struct {
 
+	exactDomains    map[string]bool
+	wildcardDomains []string
+
 	SocksDomains []string `json:"socks_domains,omitempty"`
 
 	logger *zap.Logger
@@ -140,6 +143,17 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		if len(h.ProbeResistance.Domain) > 0 {
 			h.logger.Info("Secret domain used to connect to proxy: " + h.ProbeResistance.Domain)
 		}
+
+		// 新添加的代码，处理 SocksDomains
+		h.exactDomains = make(map[string]bool)
+		h.wildcardDomains = []string{}
+		for _, domain := range h.SocksDomains {
+			if strings.HasPrefix(domain, "*.") {
+				h.wildcardDomains = append(h.wildcardDomains, domain[2:])
+			} else {
+				h.exactDomains[domain] = true
+			}
+		}
 	}
 
 	dialer := &net.Dialer{
@@ -211,10 +225,12 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		}
 	}
 
+
+
 	return nil
 }
 
-func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtshouldUseUpstreamProxytp.Handler) error {
 	// start by splitting the request host and port
 	reqHost, _, err := net.SplitHostPort(r.Host)
 	if err != nil {
@@ -526,13 +542,20 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 	return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("no allowed IP addresses for %s", host))
 }
 
-// 在 dialContextCheckACL 方法后添加这个新方法
+//add shouldUseUpstreamProxy
 func (h *Handler) shouldUseUpstreamProxy(host string) bool {
-	for _, domain := range h.SocksDomains {
-		if strings.HasSuffix(host, domain) {
+	// 检查精确匹配
+	if h.exactDomains[host] {
+		return true
+	}
+
+	// 检查泛域名匹配
+	for _, wildcardDomain := range h.wildcardDomains {
+		if strings.HasSuffix(host, wildcardDomain) {
 			return true
 		}
 	}
+
 	return false
 }
 
