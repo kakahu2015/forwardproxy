@@ -1,18 +1,3 @@
-// Copyright 2017 Google Inc.
-///
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-//
-// Caching is purposefully ignored.
 
 package forwardproxy
 
@@ -57,8 +42,6 @@ type Handler struct {
 
 	SocksDomains []string `json:"socks_domains,omitempty"`
 
-	parsedSocksDomains []domainRule
-
 	logger *zap.Logger
 
 	// Filename of the PAC file to serve.
@@ -101,13 +84,6 @@ type Handler struct {
 	AuthCredentials [][]byte `json:"auth_credentials,omitempty"` // slice with base64-encoded credentials
 }
 
-type domainRule struct {
-    prefix string
-    suffix string
-    isWildcard bool
-}
-
-
 // CaddyModule returns the Caddy module information.
 func (Handler) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
@@ -118,104 +94,127 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 
 // Provision ensures that h is set up properly before use.
 func (h *Handler) Provision(ctx caddy.Context) error {
-    h.logger = ctx.Logger(h)
+	h.logger = ctx.Logger(h)
 
-    if h.DialTimeout <= 0 {
-        h.DialTimeout = caddy.Duration(30 * time.Second)
-    }
+	if h.DialTimeout <= 0 {
+		h.DialTimeout = caddy.Duration(30 * time.Second)
+	}
 
-    h.httpTransport = &http.Transport{
-        Proxy:               http.ProxyFromEnvironment,
-        MaxIdleConns:        50,
-        IdleConnTimeout:     60 * time.Second,
-        TLSHandshakeTimeout: 10 * time.Second,
-    }
+	h.httpTransport = &http.Transport{
+		Proxy:               http.ProxyFromEnvironment,
+		MaxIdleConns:        50,
+		IdleConnTimeout:     60 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
 
-    // 设置原始的 dialContext
-    dialer := &net.Dialer{
-        Timeout:   time.Duration(h.DialTimeout),
-        KeepAlive: 30 * time.Second,
-        DualStack: true,
-    }
-    h.originalDialContext = dialer.DialContext
+	// access control lists
+	for _, rule := range h.ACL {
+		for _, subj := range rule.Subjects {
+			ar, err := newACLRule(subj, rule.Allow)
+			if err != nil {
+				return err
+			}
+			h.aclRules = append(h.aclRules, ar)
+		}
+	}
+	for _, ipDeny := range []string{
+		"10.0.0.0/8",
+		"127.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"::1/128",
+		"fe80::/10",
+	} {
+		ar, err := newACLRule(ipDeny, false)
+		if err != nil {
+			return err
+		}
+		h.aclRules = append(h.aclRules, ar)
+	}
+	h.aclRules = append(h.aclRules, &aclAllRule{allow: true})
 
-    // 解析 upstream URL
-    if h.Upstream != "" {
-        upstreamURL, err := url.Parse(h.Upstream)
-        if err != nil {
-            return fmt.Errorf("bad upstream URL: %v", err)
-        }
-        h.upstream = upstreamURL
+	if h.ProbeResistance != nil {
+		if h.AuthCredentials == nil {
+			return fmt.Errorf("probe resistance requires authentication")
+		}
+		if len(h.ProbeResistance.Domain) > 0 {
+			h.logger.Info("Secret domain used to connect to proxy: " + h.ProbeResistance.Domain)
+		}
+	}
 
-        if !isLocalhost(h.upstream.Hostname()) && h.upstream.Scheme != "https" {
-            return errors.New("insecure schemes are only allowed to localhost upstreams")
-        }
-    }
+	dialer := &net.Dialer{
+		Timeout:   time.Duration(h.DialTimeout),
+		KeepAlive: 30 * time.Second,
+		DualStack: true,
+	}
+	h.dialContext = dialer.DialContext
+	h.httpTransport.DialContext = func(ctx context.Context, network string, address string) (net.Conn, error) {
+		return h.dialContextCheckACL(ctx, network, address)
+	}
 
-    // 设置新的 dialContext
-    h.dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-        host, _, err := net.SplitHostPort(address)
-        if err != nil {
-            return nil, err
-        }
+	if h.Upstream != "" {
+		upstreamURL, err := url.Parse(h.Upstream)
+		if err != nil {
+			return fmt.Errorf("bad upstream URL: %v", err)
+		}
+		h.upstream = upstreamURL
 
-        if h.shouldUseSocksProxy(host) && h.upstream != nil {
-            // 使用 SOCKS5 代理
-            socksDialer, err := proxy.SOCKS5("tcp", h.upstream.Host, nil, proxy.Direct)
-            if err != nil {
-                return nil, fmt.Errorf("failed to create SOCKS5 dialer: %v", err)
-            }
-            return socksDialer.Dial(network, address)
-        }
+		if !isLocalhost(h.upstream.Hostname()) && h.upstream.Scheme != "https" {
+			return errors.New("insecure schemes are only allowed to localhost upstreams")
+		}
 
-        // 使用原始的直接连接
-        return h.originalDialContext(ctx, network, address)
-    }
+		registerHTTPDialer := func(u *url.URL, _ proxy.Dialer) (proxy.Dialer, error) {
+			// CONNECT request is proxied as-is, so we don't care about target url, but it could be
+			// useful in future to implement policies of choosing between multiple upstream servers.
+			// Given dialer is not used, since it's the same dialer provided by us.
+			d, err := httpclient.NewHTTPConnectDialer(h.upstream.String())
+			if err != nil {
+				return nil, err
+			}
+			d.Dialer = *dialer
+			if isLocalhost(h.upstream.Hostname()) && h.upstream.Scheme == "https" {
+				// disabling verification helps with testing the package and setups
+				// either way, it's impossible to have a legit TLS certificate for "127.0.0.1" - TODO: not true anymore
+				h.logger.Info("Localhost upstream detected, disabling verification of TLS certificate")
+				d.DialTLS = func(network string, address string) (net.Conn, string, error) {
+					conn, err := tls.Dial(network, address, &tls.Config{InsecureSkipVerify: true}) // #nosec G402
+					if err != nil {
+						return nil, "", err
+					}
+					return conn, conn.ConnectionState().NegotiatedProtocol, nil
+				}
+			}
+			return d, nil
+		}
+		proxy.RegisterDialerType("https", registerHTTPDialer)
+		proxy.RegisterDialerType("http", registerHTTPDialer)
 
-    // 设置 httpTransport 的 DialContext
-    h.httpTransport.DialContext = func(ctx context.Context, network string, address string) (net.Conn, error) {
-        return h.dialContextCheckACL(ctx, network, address)
-    }
+		upstreamDialer, err := proxy.FromURL(h.upstream, dialer)
+		if err != nil {
+			return errors.New("failed to create proxy to upstream: " + err.Error())
+		}
 
-    // ACL 规则处理
-    for _, rule := range h.ACL {
-        for _, subj := range rule.Subjects {
-            ar, err := newACLRule(subj, rule.Allow)
-            if err != nil {
-                return fmt.Errorf("error creating ACL rule: %v", err)
-            }
-            h.aclRules = append(h.aclRules, ar)
-        }
-    }
+		if ctxDialer, ok := upstreamDialer.(dialContexter); ok {
+			// upstreamDialer has DialContext - use it
+			h.dialContext = ctxDialer.DialContext
+		} else {
+			// upstreamDialer does not have DialContext - ignore the context :(
+			h.dialContext = func(ctx context.Context, network string, address string) (net.Conn, error) {
+				host, _, err := net.SplitHostPort(address)
+				if err != nil {
+					host = address
+				}
 
-    // 添加默认的 ACL 规则
-    for _, ipDeny := range []string{
-        "10.0.0.0/8",
-        "127.0.0.0/8",
-        "172.16.0.0/12",
-        "192.168.0.0/16",
-        "::1/128",
-        "fe80::/10",
-    } {
-        ar, err := newACLRule(ipDeny, false)
-        if err != nil {
-            return fmt.Errorf("error creating default ACL rule: %v", err)
-        }
-        h.aclRules = append(h.aclRules, ar)
-    }
-    h.aclRules = append(h.aclRules, &aclAllRule{allow: true})
+				if h.shouldUseUpstreamProxy(host) {
+					return upstreamDialer.Dial(network, address)
+				}
 
-    // 处理 probe resistance 配置
-    if h.ProbeResistance != nil {
-        if h.AuthCredentials == nil {
-            return fmt.Errorf("probe resistance requires authentication")
-        }
-        if len(h.ProbeResistance.Domain) > 0 {
-            h.logger.Info("Secret domain used to connect to proxy: " + h.ProbeResistance.Domain)
-        }
-    }
+				return dialer.DialContext(ctx, network, address)
+			}
+		}
+	}
 
-    return nil
+	return nil
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
@@ -489,7 +488,6 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 	}
 
 
-
 	if h.upstream != nil {
 		// if upstreaming -- do not resolve locally nor check acl
 		conn, err = h.dialContext(ctx, network, hostPort)
@@ -499,7 +497,6 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 		}
 		return conn, nil
 	}
-
 
 	if !h.portIsAllowed(port) {
 		// return nil, &proxyError{S: "port " + port + " is not allowed", Code: http.StatusForbidden}
@@ -532,14 +529,14 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 	return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("no allowed IP addresses for %s", host))
 }
 
-// Add this new method to the Handler struct
-func (h *Handler) shouldUseSocksProxy(host string) bool {
-    for _, domain := range h.SocksDomains {
-        if strings.HasSuffix(host, domain) {
-            return true
-        }
-    }
-    return false
+// 在 dialContextCheckACL 方法后添加这个新方法
+func (h *Handler) shouldUseUpstreamProxy(host string) bool {
+	for _, domain := range h.SocksDomains {
+		if strings.HasSuffix(host, domain) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h Handler) hostIsAllowed(hostname string, ip net.IP) bool {
