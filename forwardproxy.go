@@ -230,7 +230,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	return nil
 }
 
-func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtshouldUseUpstreamProxytp.Handler) error {
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	// start by splitting the request host and port
 	reqHost, _, err := net.SplitHostPort(r.Host)
 	if err != nil {
