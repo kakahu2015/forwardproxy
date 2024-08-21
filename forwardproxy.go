@@ -194,23 +194,20 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 			return errors.New("failed to create proxy to upstream: " + err.Error())
 		}
 
-		if ctxDialer, ok := upstreamDialer.(dialContexter); ok {
-			// upstreamDialer has DialContext - use it
-			h.dialContext = ctxDialer.DialContext
-		} else {
-			// upstreamDialer does not have DialContext - ignore the context :(
-			h.dialContext = func(ctx context.Context, network string, address string) (net.Conn, error) {
-				host, _, err := net.SplitHostPort(address)
-				if err != nil {
-					host = address
-				}
-
-				if h.shouldUseUpstreamProxy(host) {
-					return upstreamDialer.Dial(network, address)
-				}
-
-				return dialer.DialContext(ctx, network, address)
+		h.dialContext = func(ctx context.Context, network string, address string) (net.Conn, error) {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				host = address
 			}
+
+			if h.shouldUseUpstreamProxy(host) {
+				if ctxDialer, ok := upstreamDialer.(dialContexter); ok {
+					return ctxDialer.DialContext(ctx, network, address)
+				}
+				return upstreamDialer.Dial(network, address)
+			}
+
+			return dialer.DialContext(ctx, network, address)
 		}
 	}
 
