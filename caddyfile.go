@@ -131,19 +131,30 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.Err("dial_timeout cannot be negative.")
 			}
 			h.DialTimeout = caddy.Duration(timeout)
-		case "upstream":
-			if len(args) != 1 {
-				return d.ArgErr()
-			}
-			if h.Upstream != "" {
-				return d.Err("upstream directive specified more than once")
-			}
-			h.Upstream = args[0]
-		case "socks_domains":
-			if len(args) == 0 {
-				return d.ArgErr()
-			}
-			h.SocksDomains = args
+        case "upstream":
+            if !d.NextArg() {
+                return d.ArgErr()
+            }
+            upstreamURL, err := url.Parse(d.Val())
+            if err != nil {
+                return d.Errf("bad upstream URL: %v", err)
+            }
+            config := UpstreamConfig{URL: upstreamURL}
+            
+            // 解析 socks_domains
+            for nesting := d.Nesting(); d.NextBlock(nesting); {
+                if d.Val() == "socks_domains" {
+                    config.SocksDomains = d.RemainingArgs()
+                    if len(config.SocksDomains) == 0 {
+                        return d.ArgErr()
+                    }
+                } else {
+                    return d.Errf("unknown subdirective for upstream: %s", d.Val())
+                }
+            }
+            
+            h.UpstreamConfigs = append(h.UpstreamConfigs, config)
+
 		case "acl":
 			for nesting := d.Nesting(); d.NextBlock(nesting); {
 				aclDirective := d.Val()
