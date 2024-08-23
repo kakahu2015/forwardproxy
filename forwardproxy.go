@@ -80,7 +80,7 @@ type Handler struct {
 
 	// overridden dialContext allows us to redirect requests to upstream proxy
 	dialContext func(ctx context.Context, network, address string) (net.Conn, error)
-	upstream    *url.URL // address of upstream proxy
+	//upstream    *url.URL // address of upstream proxy
 
 	aclRules []aclRule
 
