@@ -39,11 +39,12 @@ func init() {
 //
 // EXPERIMENTAL: This handler is still experimental and subject to breaking changes.
 type Handler struct {
+	UpstreamConfigs []UpstreamConfig `json:"upstream_configs,omitempty"`
 
 	exactDomains    map[string]bool
 	wildcardDomains []string
 
-	SocksDomains []string `json:"socks_domains,omitempty"`
+	//SocksDomains []string `json:"socks_domains,omitempty"`
 
 	logger *zap.Logger
 
@@ -67,7 +68,7 @@ type Handler struct {
 	DialTimeout caddy.Duration `json:"dial_timeout,omitempty"`
 
 	// Optionally configure an upstream proxy to use.
-	Upstream string `json:"upstream,omitempty"`
+	//Upstream string `json:"upstream,omitempty"`
 
 	// Access control list.
 	ACL []ACLRule `json:"acl,omitempty"`
@@ -85,6 +86,11 @@ type Handler struct {
 
 	// TODO: temporary/deprecated - we should try to reuse existing authentication modules instead!
 	AuthCredentials [][]byte `json:"auth_credentials,omitempty"` // slice with base64-encoded credentials
+}
+
+type UpstreamConfig struct {
+    URL          *url.URL `json:"url,omitempty"`
+    SocksDomains []string `json:"socks_domains,omitempty"`
 }
 
 // CaddyModule returns the Caddy module information.
@@ -145,7 +151,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		}
 
 		// 新添加的代码，处理 SocksDomains
-		h.exactDomains = make(map[string]bool)
+		/*h.exactDomains = make(map[string]bool)
 		h.wildcardDomains = []string{}
 		for _, domain := range h.SocksDomains {
 			if strings.HasPrefix(domain, "*.") {
@@ -153,7 +159,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 			} else {
 				h.exactDomains[domain] = true
 			}
-		}
+		}*/
 	}
 
 	dialer := &net.Dialer{
@@ -166,14 +172,14 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		return h.dialContextCheckACL(ctx, network, address)
 	}
 
-	if h.Upstream != "" {
-		upstreamURL, err := url.Parse(h.Upstream)
+	if h.UpstreamConfigs != "" {
+		upstreamURL, err := url.Parse(h.UpstreamConfigs)
 		if err != nil {
 			return fmt.Errorf("bad upstream URL: %v", err)
 		}
-		h.upstream = upstreamURL
+		h.UpstreamConfigs = upstreamURL
 
-		if !isLocalhost(h.upstream.Hostname()) && h.upstream.Scheme != "https" {
+		if !isLocalhost(h.upstream.Hostname()) && h.UpstreamConfigs.Scheme != "https" {
 			return errors.New("insecure schemes are only allowed to localhost upstreams")
 		}
 
@@ -181,12 +187,12 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 			// CONNECT request is proxied as-is, so we don't care about target url, but it could be
 			// useful in future to implement policies of choosing between multiple upstream servers.
 			// Given dialer is not used, since it's the same dialer provided by us.
-			d, err := httpclient.NewHTTPConnectDialer(h.upstream.String())
+			d, err := httpclient.NewHTTPConnectDialer(h.UpstreamConfigs.String())
 			if err != nil {
 				return nil, err
 			}
 			d.Dialer = *dialer
-			if isLocalhost(h.upstream.Hostname()) && h.upstream.Scheme == "https" {
+			if isLocalhost(h.UpstreamConfigs.Hostname()) && h.UpstreamConfigs.Scheme == "https" {
 				// disabling verification helps with testing the package and setups
 				// either way, it's impossible to have a legit TLS certificate for "127.0.0.1" - TODO: not true anymore
 				h.logger.Info("Localhost upstream detected, disabling verification of TLS certificate")
@@ -203,10 +209,11 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		proxy.RegisterDialerType("https", registerHTTPDialer)
 		proxy.RegisterDialerType("http", registerHTTPDialer)
 
-		upstreamDialer, err := proxy.FromURL(h.upstream, dialer)
+		upstreamDialer, err := proxy.FromURL(h.UpstreamConfigs, dialer)
 		if err != nil {
 			return errors.New("failed to create proxy to upstream: " + err.Error())
 		}
+
 
 		h.dialContext = func(ctx context.Context, network string, address string) (net.Conn, error) {
 			host, _, err := net.SplitHostPort(address)
@@ -214,14 +221,21 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 				host = address
 			}
 
-			if h.shouldUseUpstreamProxy(host) {
+			/*if h.shouldUseUpstreamProxy(host) {
 				if ctxDialer, ok := upstreamDialer.(dialContexter); ok {
 					return ctxDialer.DialContext(ctx, network, address)
 				}
 				return upstreamDialer.Dial(network, address)
-			}
+			}*/
 
-			return dialer.DialContext(ctx, network, address)
+			//return dialer.DialContext(ctx, network, address)
+			// 如果没有匹配的 upstream，使用直接连接
+			for _, config := range h.UpstreamConfigs {
+				if h.shouldUseUpstreamProxy(host, config) {
+					return h.dialUpstream(ctx, network, address, config.URL)
+				}
+			}
+			return (&net.Dialer{Timeout: time.Duration(h.DialTimeout)}).DialContext(ctx, network, address)
 		}
 	}
 
@@ -367,7 +381,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 
 	var response *http.Response
-	if h.upstream == nil {
+	if h.UpstreamConfigs == nil {
 		// non-upstream request uses httpTransport to reuse connections
 		if r.Body != nil &&
 			(r.Method == "GET" || r.Method == "HEAD" || r.Method == "OPTIONS" || r.Method == "TRACE") {
@@ -390,7 +404,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		// reused, but Transport thinks they go to different Hosts, so it spawns tons of
 		// useless connections.
 		// Just use dialContext, which will multiplex via single connection, if http/2
-		if creds := h.upstream.User.String(); creds != "" {
+		if creds := h.UpstreamConfigs.User.String(); creds != "" {
 			// set upstream credentials for the request, if needed
 			r.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(creds)))
 		}
@@ -501,7 +515,7 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 	}
 
 
-	if h.upstream != nil {
+	if h.UpstreamConfigs != nil {
 		// if upstreaming -- do not resolve locally nor check acl
 		conn, err = h.dialContext(ctx, network, hostPort)
 		if err != nil {
@@ -543,7 +557,7 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 }
 
 //add shouldUseUpstreamProxy
-func (h *Handler) shouldUseUpstreamProxy(host string) bool {
+/*func (h *Handler) shouldUseUpstreamProxy(host string) bool {
 	// 检查精确匹配
 	if h.exactDomains[host] {
 		return true
@@ -557,6 +571,33 @@ func (h *Handler) shouldUseUpstreamProxy(host string) bool {
 	}
 
 	return false
+}*/
+func (h *Handler) shouldUseUpstreamProxy(host string, config UpstreamConfig) bool {
+    for _, domain := range config.SocksDomains {
+        if strings.HasSuffix(host, domain) {
+            return true
+        }
+    }
+    return false
+}
+
+func (h *Handler) dialUpstream(ctx context.Context, network, address string, upstreamURL *url.URL) (net.Conn, error) {
+    switch upstreamURL.Scheme {
+    case "socks5":
+        dialer, err := proxy.SOCKS5("tcp", upstreamURL.Host, nil, proxy.Direct)
+        if err != nil {
+            return nil, err
+        }
+        return dialer.Dial(network, address)
+    case "http", "https":
+        proxyDialer, err := httpclient.NewHTTPConnectDialer(upstreamURL.String())
+        if err != nil {
+            return nil, err
+        }
+        return proxyDialer.DialContext(ctx, network, address)
+    default:
+        return nil, fmt.Errorf("unsupported upstream scheme: %s", upstreamURL.Scheme)
+    }
 }
 
 func (h Handler) hostIsAllowed(hostname string, ip net.IP) bool {
