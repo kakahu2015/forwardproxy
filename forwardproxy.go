@@ -183,32 +183,30 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 			return errors.New("insecure schemes are only allowed to localhost upstreams")
 		}
 
-		registerHTTPDialer := func(u *url.URL, _ proxy.Dialer) (proxy.Dialer, error) {
-			// CONNECT request is proxied as-is, so we don't care about target url, but it could be
-			// useful in future to implement policies of choosing between multiple upstream servers.
-			// Given dialer is not used, since it's the same dialer provided by us.
-			d, err := httpclient.NewHTTPConnectDialer(h.UpstreamConfigs.String())
-			if err != nil {
-				return nil, err
-			}
-			d.Dialer = *dialer
-			if isLocalhost(h.UpstreamConfigs.Hostname()) && h.UpstreamConfigs.Scheme == "https" {
-				// disabling verification helps with testing the package and setups
-				// either way, it's impossible to have a legit TLS certificate for "127.0.0.1" - TODO: not true anymore
-				h.logger.Info("Localhost upstream detected, disabling verification of TLS certificate")
-				d.DialTLS = func(network string, address string) (net.Conn, string, error) {
-					conn, err := tls.Dial(network, address, &tls.Config{InsecureSkipVerify: true}) // #nosec G402
-					if err != nil {
-						return nil, "", err
-					}
-					return conn, conn.ConnectionState().NegotiatedProtocol, nil
+		if len(h.UpstreamConfigs) > 0 {
+			for _, config := range h.UpstreamConfigs {
+				if config.URL == nil {
+					return fmt.Errorf("upstream config has no URL")
+				}
+				if !isLocalhost(config.URL.Hostname()) && config.URL.Scheme != "https" {
+					return errors.New("insecure schemes are only allowed to localhost upstreams")
 				}
 			}
-			return d, nil
+		
+			h.dialContext = func(ctx context.Context, network string, address string) (net.Conn, error) {
+				host, _, err := net.SplitHostPort(address)
+				if err != nil {
+					host = address
+				}
+		
+				for _, config := range h.UpstreamConfigs {
+					if h.shouldUseUpstreamProxy(host, config) {
+						return h.dialUpstream(ctx, network, address, config.URL)
+					}
+				}
+				return (&net.Dialer{Timeout: time.Duration(h.DialTimeout)}).DialContext(ctx, network, address)
+			}
 		}
-		proxy.RegisterDialerType("https", registerHTTPDialer)
-		proxy.RegisterDialerType("http", registerHTTPDialer)
-
 		upstreamDialer, err := proxy.FromURL(h.UpstreamConfigs, dialer)
 		if err != nil {
 			return errors.New("failed to create proxy to upstream: " + err.Error())
@@ -381,7 +379,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 
 	var response *http.Response
-	if h.UpstreamConfigs == nil {
+	if len(h.UpstreamConfigs) == 0 {
 		// non-upstream request uses httpTransport to reuse connections
 		if r.Body != nil &&
 			(r.Method == "GET" || r.Method == "HEAD" || r.Method == "OPTIONS" || r.Method == "TRACE") {
@@ -515,15 +513,6 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 	}
 
 
-	if h.UpstreamConfigs != nil {
-		// if upstreaming -- do not resolve locally nor check acl
-		conn, err = h.dialContext(ctx, network, hostPort)
-		if err != nil {
-			// return conn, &proxyError{S: err.Error(), Code: http.StatusBadGateway}
-			return conn, caddyhttp.Error(http.StatusBadGateway, err)
-		}
-		return conn, nil
-	}
 
 	if !h.portIsAllowed(port) {
 		// return nil, &proxyError{S: "port " + port + " is not allowed", Code: http.StatusForbidden}
